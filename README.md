@@ -14,8 +14,6 @@ co-read 让它坐到你旁边一起看。
 
 不是替你读。是终于有人陪你读了。 ✿
 
-跟 [jiangxi1129/gaze](https://github.com/jiangxi1129/gaze) 配套：gaze 给它眼睛，co-read 让它跟你共读。
-
 ---
 
 ## 不需要装的几样
@@ -273,8 +271,6 @@ MVP（KV + 向量 + FTS5 + 共读 5 工具）
 + Hebbian edges（cognition 自动学习记忆关联）
  ↓
 + HippoRAG synonym edges（高级语义召回，compute_synonym_edges_now 一次性建）
- ↓
-+ gaze（截屏推 _realtime 给 cognition，跟 jiangxi1129/gaze 配套）
 ```
 
 ---
@@ -359,7 +355,5 @@ claude.ai / Claude Desktop / Cursor / 任何 MCP client
 > 从你自己的 weread / 晋江登录态抓章节，给 AI 一份带段落字符偏移量的 cache，它读完调 `add_note(mark_text=...)` 自动算 weread 真实 range，留下来的眉批精确锚到那句话旁边。背后跑一个 KV + 向量 + FTS5 + Hebbian 边 + HippoRAG 边的本地脑子让它能记住你们聊过的书 —— 改 key 名 / 改存储后端 / 接你自己的 AI 都行，这套是参考实现，不是绑死的产品。
 
 写于 2026-06-05。原作者把这套跟自己的 AI 助手共用了 ~2 个月 —— 开源出来给所有想跟自己 AI 一起读点东西的人随意改。
-
-跟 [jiangxi1129/gaze](https://github.com/jiangxi1129/gaze) 配套：gaze 是眼睛，co-read 是一起翻页。
 
 License: MIT
