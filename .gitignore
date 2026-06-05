@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+.env.local
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Runtime data (users should NEVER commit their own memory / cookies)
+*.json
+!.env.example
+!nginx/*.conf.example
+*.db
+*.sqlite
+*.sqlite3
+.mcp-memory/
+~/.mcp-memory/
+
+# Playwright
+.playwright/
+
+# Logs
+*.log
+logs/
+
+# Backups
+*.bak
+backups/
+
+# Build artifacts
+build/
+dist/
+*.egg

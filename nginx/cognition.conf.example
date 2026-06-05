@@ -1,0 +1,51 @@
+# nginx reverse proxy for the MCP servers.
+# Put this in /etc/nginx/sites-available/cognition.conf and symlink to
+# sites-enabled. Replace YOUR_DOMAIN + the random secrets.
+#
+# The random secret in the URL path is a soft "no enumeration" defense —
+# anyone with the URL can use it, so do NOT share these URLs publicly.
+# Combined with claude.ai's connector-side auth, this is enough for a
+# personal-use setup.
+
+server {
+    listen 443 ssl http2;
+    server_name YOUR_DOMAIN;
+
+    # SSL — use certbot to fill in real cert paths
+    ssl_certificate     /etc/letsencrypt/live/YOUR_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/YOUR_DOMAIN/privkey.pem;
+
+    # Full-feature cognition (port 8769) — admin URL
+    # Pick a long random string. Don't share this URL.
+    location /cognition-RANDOM_SECRET_HERE/mcp {
+        proxy_pass http://127.0.0.1:8769/mcp;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Connection "";
+
+        # MCP uses streaming HTTP — important to disable buffering
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300s;
+    }
+
+    # Lite cognition (port 8775) — the URL you give to your AI persona
+    location /cognition-lite-DIFFERENT_RANDOM_SECRET/mcp {
+        proxy_pass http://127.0.0.1:8775/mcp;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300s;
+    }
+}
+
+# HTTP → HTTPS redirect
+server {
+    listen 80;
+    server_name YOUR_DOMAIN;
+    return 301 https://$host$request_uri;
+}
