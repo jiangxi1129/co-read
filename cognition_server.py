@@ -48,6 +48,40 @@ PAPER_TRAIL_PREFIXES = ("procedural:", "todo:", "project:", "case:")
 PAPER_TRAIL_MAX_VERSIONS = int(os.environ.get("PAPER_TRAIL_MAX_VERSIONS", 5))
 PAPER_TRAIL_MIN_DIFF_CHARS = int(os.environ.get("PAPER_TRAIL_MIN_DIFF_CHARS", 20))
 
+# ─── Bare-key guard ─────────────────────────────────────────────────────
+# Reject keys that have no sector prefix (e.g. a raw "2026-06-01T16:48:topic"),
+# because they bypass list_by_room / sector navigation and silently rot.
+#   ENFORCE_KEY_PREFIX=0          → disable the guard entirely
+#   ALLOWED_KEY_PREFIXES="a:,b:"  → strict allow-list (only these prefixes pass)
+# With no allow-list set, the guard just rejects no-colon keys and bare
+# timestamp keys, which is enough to stop the most common "naked key" leak.
+ENFORCE_KEY_PREFIX = os.environ.get("ENFORCE_KEY_PREFIX", "1") != "0"
+ALLOWED_KEY_PREFIXES = tuple(
+    p.strip() for p in os.environ.get("ALLOWED_KEY_PREFIXES", "").split(",") if p.strip()
+)
+_BARE_TS_KEY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _validate_key(key: str):
+    """Return an error string if `key` lacks a proper sector prefix, else None."""
+    k = (key or "").strip()
+    if not k:
+        return "key must not be empty"
+    if k.startswith("_"):  # system keys (_meta:/_system:/_realtime:) are exempt
+        return None
+    if ALLOWED_KEY_PREFIXES:
+        if not any(k.startswith(p) for p in ALLOWED_KEY_PREFIXES):
+            return (f"key '{k[:40]}' is not under an allowed sector prefix; "
+                    f"allowed: {', '.join(ALLOWED_KEY_PREFIXES)}")
+        return None
+    if ":" not in k:
+        return (f"key '{k[:40]}' has no sector prefix — use 'sector:identifier' "
+                f"(e.g. 'episodic:2026-...', 'semantic:...', 'spark:...')")
+    if _BARE_TS_KEY_RE.match(k):
+        return (f"bare timestamp key '{k[:40]}' — missing sector prefix; prepend a "
+                f"sector such as 'episodic:'/'semantic:'/'spark:'/'community:'")
+    return None
+
 mcp = FastMCP("cognition", host="127.0.0.1", port=COGNITION_PORT)
 
 
@@ -163,14 +197,24 @@ def _parse_ts_from_key(key: str) -> float:
 # ─── Core MCP tools: save / get / list / forget ─────────────────────────
 
 @mcp.tool()
-def save_memory(key: str, value: str) -> dict:
+def save_memory(key: str, value: str, force: bool = False) -> dict:
     """Save a memory under `key`. Existing value is overwritten.
+
+    Keys must carry a sector prefix (e.g. 'episodic:', 'semantic:'); bare
+    timestamp keys like '2026-06-01T16:48:topic' are rejected so they don't
+    bypass sector navigation. Pass force=True to override, or set
+    ENFORCE_KEY_PREFIX=0 to disable the guard globally.
 
     For keys in PAPER_TRAIL_PREFIXES sectors (procedural:/todo:/project:/case:),
     old versions are auto-archived to _meta:trail:<key> on significant change.
     """
     if not key or not key.strip():
         return {"error": "key must not be empty"}
+    if ENFORCE_KEY_PREFIX and not force:
+        err = _validate_key(key)
+        if err:
+            return {"error": err,
+                    "hint": "fix the key's sector prefix, or pass force=True to override"}
     _save_key(key.strip(), value)
     return {"saved": key.strip(), "length": len(value)}
 
