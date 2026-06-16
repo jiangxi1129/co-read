@@ -82,6 +82,39 @@ def _validate_key(key: str):
                 f"sector such as 'episodic:'/'semantic:'/'spark:'/'community:'")
     return None
 
+
+# ─── Key alias normalization ────────────────────────────────────────────
+# Fold alias prefixes onto a canonical one at write time, so the same thing
+# stored under drifting names all lands in one sector — e.g. arcadia: vs
+# project:桃源:, or a person stored under cc:/栈:/江栈:. Configure via env:
+#   KEY_ALIASES="alias1:>canonical1:,alias2:>canonical2:"
+# Empty by default (no-op). Applied before the bare-key guard. First match wins.
+def _parse_aliases(raw: str):
+    pairs = []
+    for item in raw.split(","):
+        if ">" in item:
+            alias, canon = item.split(">", 1)
+            alias = alias.strip()
+            if alias:
+                pairs.append((alias, canon.strip()))
+    return tuple(pairs)
+
+
+KEY_ALIASES = _parse_aliases(os.environ.get("KEY_ALIASES", ""))
+
+
+def _normalize_key(key: str):
+    """Fold an alias prefix onto its canonical form.
+
+    Returns (new_key, matched_alias_or_None). No-op if nothing matches.
+    """
+    k = (key or "").strip()
+    for alias, canon in KEY_ALIASES:
+        if k.startswith(alias):
+            return canon + k[len(alias):], alias
+    return k, None
+
+
 mcp = FastMCP("cognition", host="127.0.0.1", port=COGNITION_PORT)
 
 
@@ -200,23 +233,29 @@ def _parse_ts_from_key(key: str) -> float:
 def save_memory(key: str, value: str, force: bool = False) -> dict:
     """Save a memory under `key`. Existing value is overwritten.
 
-    Keys must carry a sector prefix (e.g. 'episodic:', 'semantic:'); bare
-    timestamp keys like '2026-06-01T16:48:topic' are rejected so they don't
-    bypass sector navigation. Pass force=True to override, or set
-    ENFORCE_KEY_PREFIX=0 to disable the guard globally.
+    The key is first normalized through KEY_ALIASES (alias prefixes folded onto
+    a canonical sector). Then it must carry a sector prefix; bare timestamp keys
+    like '2026-06-01T16:48:topic' are rejected so they don't bypass sector
+    navigation. Pass force=True to override the guard, or set ENFORCE_KEY_PREFIX=0
+    to disable it globally.
 
     For keys in PAPER_TRAIL_PREFIXES sectors (procedural:/todo:/project:/case:),
     old versions are auto-archived to _meta:trail:<key> on significant change.
     """
     if not key or not key.strip():
         return {"error": "key must not be empty"}
+    norm_key, matched_alias = _normalize_key(key)
     if ENFORCE_KEY_PREFIX and not force:
-        err = _validate_key(key)
+        err = _validate_key(norm_key)
         if err:
             return {"error": err,
                     "hint": "fix the key's sector prefix, or pass force=True to override"}
-    _save_key(key.strip(), value)
-    return {"saved": key.strip(), "length": len(value)}
+    _save_key(norm_key, value)
+    result = {"saved": norm_key, "length": len(value)}
+    if matched_alias:
+        result["normalized_from"] = key.strip()
+        result["note"] = f"alias '{matched_alias}' folded onto canonical prefix"
+    return result
 
 
 @mcp.tool()
