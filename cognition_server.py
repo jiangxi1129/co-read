@@ -17,6 +17,7 @@ License: MIT
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -24,9 +25,14 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl as _fcntl  # POSIX file locking; absent on Windows
+except Exception:
+    _fcntl = None
 
 from mcp.server.fastmcp import FastMCP
 
@@ -159,6 +165,48 @@ except Exception as e:
 
 # ─── Core storage helpers ───────────────────────────────────────────────
 
+_LOCK_PATH = MCP_MEMORY_DIR / ".memories.lock"
+
+
+@contextlib.contextmanager
+def _file_lock():
+    """Cross-process exclusive lock around read-modify-write of memories.json.
+
+    lite (8775) and full (8769) are separate processes sharing one json file;
+    without this, concurrent read-modify-write loses data. No-op where fcntl is
+    unavailable (e.g. Windows).
+    """
+    if _fcntl is None:
+        yield
+        return
+    with open(_LOCK_PATH, "w") as lf:
+        _fcntl.flock(lf, _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(lf, _fcntl.LOCK_UN)
+
+
+def _daily_backup() -> None:
+    """Snapshot memories.json once per day before overwrite; keep 30 days."""
+    if not MEMORIES_PATH.exists():
+        return
+    try:
+        bak = BACKUPS_DIR / f"memories.{date.today().isoformat()}.json"
+        if not bak.exists():
+            bak.write_bytes(MEMORIES_PATH.read_bytes())
+            cutoff = date.today() - timedelta(days=30)
+            for old_bak in BACKUPS_DIR.glob("memories.*.json"):
+                stamp = old_bak.name[len("memories."):-len(".json")]
+                try:
+                    if date.fromisoformat(stamp) < cutoff:
+                        old_bak.unlink()
+                except ValueError:
+                    pass
+    except Exception as e:
+        logger.warning(f"daily backup failed: {e}")
+
+
 def _load_all() -> dict:
     if not MEMORIES_PATH.exists():
         return {}
@@ -170,6 +218,7 @@ def _load_all() -> dict:
 
 
 def _save_all(data: dict) -> None:
+    _daily_backup()  # rolling daily snapshot before overwrite
     tmp = MEMORIES_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=0), encoding="utf-8")
     tmp.replace(MEMORIES_PATH)
@@ -180,35 +229,42 @@ def _now_ts() -> str:
 
 
 def _save_key(key: str, value: str) -> None:
-    """Internal save with paper-trail archival for evolving sectors."""
-    data = _load_all()
-    old = data.get(key)
-    needs_trail = (
-        isinstance(old, str)
-        and any(key.startswith(p) for p in PAPER_TRAIL_PREFIXES)
-        and old != value
-        and abs(len(old) - len(value)) >= PAPER_TRAIL_MIN_DIFF_CHARS
-    )
-    if needs_trail:
-        trail_key = f"_meta:trail:{key}"
-        existing = data.get(trail_key, "[]")
-        try:
-            trail = json.loads(existing) if isinstance(existing, str) else []
-            if not isinstance(trail, list):
+    """Internal save with paper-trail archival for evolving sectors.
+
+    The whole read-modify-write runs under a cross-process lock (see #1).
+    Paper-trail triggers on any content change of a substantial old value
+    (length-diff was the old, buggy criterion — equal-length rewrites slipped
+    through; PAPER_TRAIL_MIN_DIFF_CHARS now gates the *old value's* length).
+    """
+    with _file_lock():
+        data = _load_all()
+        old = data.get(key)
+        needs_trail = (
+            isinstance(old, str)
+            and any(key.startswith(p) for p in PAPER_TRAIL_PREFIXES)
+            and old != value
+            and len(old) >= PAPER_TRAIL_MIN_DIFF_CHARS
+        )
+        if needs_trail:
+            trail_key = f"_meta:trail:{key}"
+            existing = data.get(trail_key, "[]")
+            try:
+                trail = json.loads(existing) if isinstance(existing, str) else []
+                if not isinstance(trail, list):
+                    trail = []
+            except Exception:
                 trail = []
-        except Exception:
-            trail = []
-        trail.append({
-            "content": old[:5000],
-            "archived_at": _now_ts(),
-            "old_len": len(old),
-            "new_len": len(value),
-        })
-        trail = trail[-PAPER_TRAIL_MAX_VERSIONS:]
-        data[trail_key] = json.dumps(trail, ensure_ascii=False)
-    data[key] = value
-    _save_all(data)
-    # Update vector index (skip internal _ keys)
+            trail.append({
+                "content": old[:5000],
+                "archived_at": _now_ts(),
+                "old_len": len(old),
+                "new_len": len(value),
+            })
+            trail = trail[-PAPER_TRAIL_MAX_VERSIONS:]
+            data[trail_key] = json.dumps(trail, ensure_ascii=False)
+        data[key] = value
+        _save_all(data)
+    # Update vector index outside the lock (slow; embeddings.db has its own conn)
     if _VECTOR_OK and not key.startswith("_"):
         try:
             _vec.generate_and_store(key, f"{key}\n\n{value}")
@@ -283,14 +339,16 @@ def forget_keys(keys: list[str], dry_run: bool = True) -> dict:
 
     Returns {would_delete OR deleted, missing, total}.
     """
-    data = _load_all()
-    existing = [k for k in keys if k in data]
-    missing = [k for k in keys if k not in data]
-    if dry_run:
-        return {"would_delete": existing, "missing": missing, "total": len(existing), "dry_run": True}
-    for k in existing:
-        del data[k]
-    _save_all(data)
+    with _file_lock():
+        data = _load_all()
+        existing = [k for k in keys if k in data]
+        missing = [k for k in keys if k not in data]
+        if dry_run:
+            return {"would_delete": existing, "missing": missing, "total": len(existing), "dry_run": True}
+        for k in existing:
+            del data[k]
+            data.pop(f"_meta:trail:{k}", None)  # drop paper trail with the key
+        _save_all(data)
     if _VECTOR_OK:
         for k in existing:
             try:

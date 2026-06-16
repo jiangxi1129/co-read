@@ -86,6 +86,26 @@ def test_alias_then_guard_composition():
     assert cs._validate_key(norm) is None
 
 
+# ── storage hardening: paper-trail criterion + daily backup ─────────────
+def test_paper_trail_archives_equal_length_rewrite():
+    import json
+    k = "project:_pt_test"
+    cs._save_key(k, "A" * 60)          # substantial initial value
+    cs._save_key(k, "B" * 60)          # equal length, different content
+    data = cs._load_all()
+    assert data[k] == "B" * 60
+    trail = data.get("_meta:trail:" + k)
+    assert trail is not None, "equal-length rewrite should still archive a trail"
+    assert json.loads(trail)[0]["content"] == "A" * 60
+
+
+def test_daily_backup_snapshot_created():
+    cs._save_key("project:_bk_seed", "x" * 40)   # creates memories.json (nothing to back up yet)
+    cs._save_key("project:_bk_test", "y" * 40)   # file now exists → _daily_backup snapshots it
+    baks = list(cs.BACKUPS_DIR.glob("memories.*.json"))
+    assert len(baks) >= 1, "daily backup snapshot should exist"
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
