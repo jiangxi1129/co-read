@@ -213,11 +213,11 @@ def _encode_chapter_uid(uid: str | int) -> str:
 
 def _reader_url(book_id: str, chapter_uid: str | int | None) -> str:
     enc = _encode_book_id(book_id)
-    # Empty chapter_uid: don't append k<...> segment → weread auto-redirects to
-    # the user's last reading position or chapter 1.
     if chapter_uid is None or chapter_uid == "" or str(chapter_uid).strip() == "":
         return f"https://weread.qq.com/web/reader/{enc}"
-    return f"https://weread.qq.com/web/reader/{enc}k{_encode_chapter_uid(chapter_uid)}"
+    # WeRead changed their frontend routing — the old k{hex(uid)} suffix now
+    # returns 404. Use query parameter format instead.
+    return f"https://weread.qq.com/web/reader/{enc}?chapterUid={chapter_uid}"
 
 
 # ----------------------------- context helper ---------------------------------
