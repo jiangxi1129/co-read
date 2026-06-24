@@ -17,6 +17,7 @@ License: MIT
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -24,9 +25,14 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl as _fcntl  # POSIX file locking; absent on Windows
+except Exception:
+    _fcntl = None
 
 from mcp.server.fastmcp import FastMCP
 
@@ -47,6 +53,73 @@ BACKUPS_DIR.mkdir(exist_ok=True)
 PAPER_TRAIL_PREFIXES = ("procedural:", "todo:", "project:", "case:")
 PAPER_TRAIL_MAX_VERSIONS = int(os.environ.get("PAPER_TRAIL_MAX_VERSIONS", 5))
 PAPER_TRAIL_MIN_DIFF_CHARS = int(os.environ.get("PAPER_TRAIL_MIN_DIFF_CHARS", 20))
+
+# ─── Bare-key guard ─────────────────────────────────────────────────────
+# Reject keys that have no sector prefix (e.g. a raw "2026-06-01T16:48:topic"),
+# because they bypass list_by_room / sector navigation and silently rot.
+#   ENFORCE_KEY_PREFIX=0          → disable the guard entirely
+#   ALLOWED_KEY_PREFIXES="a:,b:"  → strict allow-list (only these prefixes pass)
+# With no allow-list set, the guard just rejects no-colon keys and bare
+# timestamp keys, which is enough to stop the most common "naked key" leak.
+ENFORCE_KEY_PREFIX = os.environ.get("ENFORCE_KEY_PREFIX", "1") != "0"
+ALLOWED_KEY_PREFIXES = tuple(
+    p.strip() for p in os.environ.get("ALLOWED_KEY_PREFIXES", "").split(",") if p.strip()
+)
+_BARE_TS_KEY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _validate_key(key: str):
+    """Return an error string if `key` lacks a proper sector prefix, else None."""
+    k = (key or "").strip()
+    if not k:
+        return "key must not be empty"
+    if k.startswith("_"):  # system keys (_meta:/_system:/_realtime:) are exempt
+        return None
+    if ALLOWED_KEY_PREFIXES:
+        if not any(k.startswith(p) for p in ALLOWED_KEY_PREFIXES):
+            return (f"key '{k[:40]}' is not under an allowed sector prefix; "
+                    f"allowed: {', '.join(ALLOWED_KEY_PREFIXES)}")
+        return None
+    if ":" not in k:
+        return (f"key '{k[:40]}' has no sector prefix — use 'sector:identifier' "
+                f"(e.g. 'episodic:2026-...', 'semantic:...', 'spark:...')")
+    if _BARE_TS_KEY_RE.match(k):
+        return (f"bare timestamp key '{k[:40]}' — missing sector prefix; prepend a "
+                f"sector such as 'episodic:'/'semantic:'/'spark:'/'community:'")
+    return None
+
+
+# ─── Key alias normalization ────────────────────────────────────────────
+# Fold alias prefixes onto a canonical one at write time, so the same thing
+# stored under drifting names all lands in one sector — e.g. arcadia: vs
+# project:桃源:, or a person stored under cc:/栈:/江栈:. Configure via env:
+#   KEY_ALIASES="alias1:>canonical1:,alias2:>canonical2:"
+# Empty by default (no-op). Applied before the bare-key guard. First match wins.
+def _parse_aliases(raw: str):
+    pairs = []
+    for item in raw.split(","):
+        if ">" in item:
+            alias, canon = item.split(">", 1)
+            alias = alias.strip()
+            if alias:
+                pairs.append((alias, canon.strip()))
+    return tuple(pairs)
+
+
+KEY_ALIASES = _parse_aliases(os.environ.get("KEY_ALIASES", ""))
+
+
+def _normalize_key(key: str):
+    """Fold an alias prefix onto its canonical form.
+
+    Returns (new_key, matched_alias_or_None). No-op if nothing matches.
+    """
+    k = (key or "").strip()
+    for alias, canon in KEY_ALIASES:
+        if k.startswith(alias):
+            return canon + k[len(alias):], alias
+    return k, None
+
 
 mcp = FastMCP("cognition", host="127.0.0.1", port=COGNITION_PORT)
 
@@ -92,6 +165,48 @@ except Exception as e:
 
 # ─── Core storage helpers ───────────────────────────────────────────────
 
+_LOCK_PATH = MCP_MEMORY_DIR / ".memories.lock"
+
+
+@contextlib.contextmanager
+def _file_lock():
+    """Cross-process exclusive lock around read-modify-write of memories.json.
+
+    lite (8775) and full (8769) are separate processes sharing one json file;
+    without this, concurrent read-modify-write loses data. No-op where fcntl is
+    unavailable (e.g. Windows).
+    """
+    if _fcntl is None:
+        yield
+        return
+    with open(_LOCK_PATH, "w") as lf:
+        _fcntl.flock(lf, _fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _fcntl.flock(lf, _fcntl.LOCK_UN)
+
+
+def _daily_backup() -> None:
+    """Snapshot memories.json once per day before overwrite; keep 30 days."""
+    if not MEMORIES_PATH.exists():
+        return
+    try:
+        bak = BACKUPS_DIR / f"memories.{date.today().isoformat()}.json"
+        if not bak.exists():
+            bak.write_bytes(MEMORIES_PATH.read_bytes())
+            cutoff = date.today() - timedelta(days=30)
+            for old_bak in BACKUPS_DIR.glob("memories.*.json"):
+                stamp = old_bak.name[len("memories."):-len(".json")]
+                try:
+                    if date.fromisoformat(stamp) < cutoff:
+                        old_bak.unlink()
+                except ValueError:
+                    pass
+    except Exception as e:
+        logger.warning(f"daily backup failed: {e}")
+
+
 def _load_all() -> dict:
     if not MEMORIES_PATH.exists():
         return {}
@@ -103,6 +218,7 @@ def _load_all() -> dict:
 
 
 def _save_all(data: dict) -> None:
+    _daily_backup()  # rolling daily snapshot before overwrite
     tmp = MEMORIES_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=0), encoding="utf-8")
     tmp.replace(MEMORIES_PATH)
@@ -113,35 +229,42 @@ def _now_ts() -> str:
 
 
 def _save_key(key: str, value: str) -> None:
-    """Internal save with paper-trail archival for evolving sectors."""
-    data = _load_all()
-    old = data.get(key)
-    needs_trail = (
-        isinstance(old, str)
-        and any(key.startswith(p) for p in PAPER_TRAIL_PREFIXES)
-        and old != value
-        and abs(len(old) - len(value)) >= PAPER_TRAIL_MIN_DIFF_CHARS
-    )
-    if needs_trail:
-        trail_key = f"_meta:trail:{key}"
-        existing = data.get(trail_key, "[]")
-        try:
-            trail = json.loads(existing) if isinstance(existing, str) else []
-            if not isinstance(trail, list):
+    """Internal save with paper-trail archival for evolving sectors.
+
+    The whole read-modify-write runs under a cross-process lock (see #1).
+    Paper-trail triggers on any content change of a substantial old value
+    (length-diff was the old, buggy criterion — equal-length rewrites slipped
+    through; PAPER_TRAIL_MIN_DIFF_CHARS now gates the *old value's* length).
+    """
+    with _file_lock():
+        data = _load_all()
+        old = data.get(key)
+        needs_trail = (
+            isinstance(old, str)
+            and any(key.startswith(p) for p in PAPER_TRAIL_PREFIXES)
+            and old != value
+            and len(old) >= PAPER_TRAIL_MIN_DIFF_CHARS
+        )
+        if needs_trail:
+            trail_key = f"_meta:trail:{key}"
+            existing = data.get(trail_key, "[]")
+            try:
+                trail = json.loads(existing) if isinstance(existing, str) else []
+                if not isinstance(trail, list):
+                    trail = []
+            except Exception:
                 trail = []
-        except Exception:
-            trail = []
-        trail.append({
-            "content": old[:5000],
-            "archived_at": _now_ts(),
-            "old_len": len(old),
-            "new_len": len(value),
-        })
-        trail = trail[-PAPER_TRAIL_MAX_VERSIONS:]
-        data[trail_key] = json.dumps(trail, ensure_ascii=False)
-    data[key] = value
-    _save_all(data)
-    # Update vector index (skip internal _ keys)
+            trail.append({
+                "content": old[:5000],
+                "archived_at": _now_ts(),
+                "old_len": len(old),
+                "new_len": len(value),
+            })
+            trail = trail[-PAPER_TRAIL_MAX_VERSIONS:]
+            data[trail_key] = json.dumps(trail, ensure_ascii=False)
+        data[key] = value
+        _save_all(data)
+    # Update vector index outside the lock (slow; embeddings.db has its own conn)
     if _VECTOR_OK and not key.startswith("_"):
         try:
             _vec.generate_and_store(key, f"{key}\n\n{value}")
@@ -163,16 +286,32 @@ def _parse_ts_from_key(key: str) -> float:
 # ─── Core MCP tools: save / get / list / forget ─────────────────────────
 
 @mcp.tool()
-def save_memory(key: str, value: str) -> dict:
+def save_memory(key: str, value: str, force: bool = False) -> dict:
     """Save a memory under `key`. Existing value is overwritten.
+
+    The key is first normalized through KEY_ALIASES (alias prefixes folded onto
+    a canonical sector). Then it must carry a sector prefix; bare timestamp keys
+    like '2026-06-01T16:48:topic' are rejected so they don't bypass sector
+    navigation. Pass force=True to override the guard, or set ENFORCE_KEY_PREFIX=0
+    to disable it globally.
 
     For keys in PAPER_TRAIL_PREFIXES sectors (procedural:/todo:/project:/case:),
     old versions are auto-archived to _meta:trail:<key> on significant change.
     """
     if not key or not key.strip():
         return {"error": "key must not be empty"}
-    _save_key(key.strip(), value)
-    return {"saved": key.strip(), "length": len(value)}
+    norm_key, matched_alias = _normalize_key(key)
+    if ENFORCE_KEY_PREFIX and not force:
+        err = _validate_key(norm_key)
+        if err:
+            return {"error": err,
+                    "hint": "fix the key's sector prefix, or pass force=True to override"}
+    _save_key(norm_key, value)
+    result = {"saved": norm_key, "length": len(value)}
+    if matched_alias:
+        result["normalized_from"] = key.strip()
+        result["note"] = f"alias '{matched_alias}' folded onto canonical prefix"
+    return result
 
 
 @mcp.tool()
@@ -200,14 +339,16 @@ def forget_keys(keys: list[str], dry_run: bool = True) -> dict:
 
     Returns {would_delete OR deleted, missing, total}.
     """
-    data = _load_all()
-    existing = [k for k in keys if k in data]
-    missing = [k for k in keys if k not in data]
-    if dry_run:
-        return {"would_delete": existing, "missing": missing, "total": len(existing), "dry_run": True}
-    for k in existing:
-        del data[k]
-    _save_all(data)
+    with _file_lock():
+        data = _load_all()
+        existing = [k for k in keys if k in data]
+        missing = [k for k in keys if k not in data]
+        if dry_run:
+            return {"would_delete": existing, "missing": missing, "total": len(existing), "dry_run": True}
+        for k in existing:
+            del data[k]
+            data.pop(f"_meta:trail:{k}", None)  # drop paper trail with the key
+        _save_all(data)
     if _VECTOR_OK:
         for k in existing:
             try:
